@@ -6,10 +6,7 @@ const dispatchLogSchema = new mongoose.Schema({
     dispatchedFrom: [{
         stockEntryId: { type: mongoose.Schema.Types.ObjectId, ref: 'StockEntry' },
         location: { type: String },
-        qty: { type: Number },
-        invoiceNo: { type: String },
-        shipName: { type: String },
-        arrivalDate: { type: Date }
+        qty: { type: Number }
     }],
     date: { type: Date, default: Date.now }
 });

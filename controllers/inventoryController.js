@@ -1,8 +1,11 @@
 const Product = require("../models/Product");
 const StockEntry = require("../models/StockEntry");
 const DispatchLog = require("../models/DispatchLog");
-const xlsx = require("xlsx");
+const UploadLog = require("../models/UploadLog");
+const ExcelJS = require("exceljs");
 const mongoose = require("mongoose");
+const path = require('path');
+const fs = require('fs');
 
 exports.uploadExcel = async (req, res) => {
   try {
@@ -10,9 +13,36 @@ exports.uploadExcel = async (req, res) => {
       return res.status(400).json({ message: "No file uploaded" });
     }
 
-    const workbook = xlsx.readFile(req.file.path, { cellDates: true });
-    const sheetName = workbook.SheetNames[0];
-    const data = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
+    const workbook = new ExcelJS.Workbook();
+    await workbook.xlsx.readFile(req.file.path);
+    const worksheet = workbook.getWorksheet(1);
+
+    const data = [];
+    const headers = [];
+
+    // Get headers from the first row
+    worksheet.getRow(1).eachCell((cell, colNumber) => {
+      headers[colNumber] = cell.value;
+    });
+
+    // Iterate through rows starting from the second row
+    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      if (rowNumber === 1) return; // Skip header row
+
+      const rowObject = {};
+      row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+        const header = headers[colNumber];
+        if (header) {
+          // If the cell is a formula, get the result. If it's a date, it should already be a Date object.
+          let value = cell.value;
+          if (value && typeof value === 'object' && value.result !== undefined) {
+            value = value.result;
+          }
+          rowObject[header] = value;
+        }
+      });
+      data.push(rowObject);
+    });
 
     const productOps = [];
     const stockEntries = [];
@@ -26,6 +56,21 @@ exports.uploadExcel = async (req, res) => {
         const now = new Date();
         return new Date(
           Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+        );
+      }
+
+      // Handle Date objects (exceljs often returns Date objects)
+      if (dateVal instanceof Date) {
+        return new Date(
+          Date.UTC(
+            dateVal.getUTCFullYear(),
+            dateVal.getUTCMonth(),
+            dateVal.getUTCDate(),
+            0,
+            0,
+            0,
+            0,
+          ),
         );
       }
 
@@ -182,9 +227,17 @@ exports.uploadExcel = async (req, res) => {
 
     await StockEntry.insertMany(stockEntries);
 
+    const uploadLog = new UploadLog({
+      uploadType: 'inventory',
+      originalFileName: req.file.originalname,
+      filePath: req.file.path,
+      rowCount: data.length
+    });
+    await uploadLog.save();
+
     res
       .status(200)
-      .json({ message: "Excel data uploaded and processed successfully" });
+      .json({ message: "Excel data uploaded and processed successfully", logId: uploadLog._id });
   } catch (error) {
     console.error("Upload Error:", error);
     res
@@ -195,7 +248,9 @@ exports.uploadExcel = async (req, res) => {
 
 exports.getInventory = async (req, res) => {
   try {
-    const inventory = await Product.aggregate([
+    const { startDate, endDate } = req.query;
+    
+    const pipeline = [
       {
         $lookup: {
           from: "stockentries",
@@ -204,8 +259,23 @@ exports.getInventory = async (req, res) => {
           as: "batches",
         },
       },
-      { $unwind: "$batches" },
-      { $match: { "batches.remainingQty": { $gt: 0 } } },
+      { $unwind: "$batches" }
+    ];
+
+    const matchQuery = { "batches.remainingQty": { $gt: 0 } };
+
+    if (startDate && endDate) {
+        const start = new Date(startDate);
+        start.setHours(0,0,0,0);
+        const end = new Date(endDate);
+        end.setHours(23,59,59,999);
+        matchQuery["batches.arrivalDate"] = { $gte: start, $lte: end };
+    }
+
+    pipeline.push({ $match: matchQuery });
+
+    const inventory = await Product.aggregate([
+      ...pipeline,
       {
         $group: {
           _id: {
@@ -301,9 +371,8 @@ exports.dispatchFIFO = async (req, res) => {
         stockEntryId: batch._id,
         location: batch.location,
         qty: deduct,
-        invoiceNo: batch.invoiceNo || '',
-        shipName: batch.shipName || '',
-        arrivalDate: batch.arrivalDate,
+        invoiceNo: batch.invoiceNo,
+        shipName: batch.shipName,
       });
 
       remainingToDispatch -= deduct;
@@ -331,109 +400,182 @@ exports.dispatchFIFO = async (req, res) => {
   }
 };
 
-exports.getDispatchReportPreview = async (req, res) => {
-  try {
-    const { startDate, endDate } = req.query;
-    const filter = {};
-    if (startDate || endDate) {
-      filter.date = {};
-      if (startDate) filter.date.$gte = new Date(startDate + 'T00:00:00.000Z');
-      if (endDate)   filter.date.$lte = new Date(endDate   + 'T23:59:59.999Z');
-    }
-    const logs = await DispatchLog.find(filter)
-      .populate('productId', 'name sku description')
-      .sort({ date: -1 });
-    res.status(200).json(logs);
-  } catch (error) {
-    res.status(500).json({ message: 'Error fetching report', error: error.message });
-  }
-};
-
 exports.exportDispatchReport = async (req, res) => {
   try {
-    const { startDate, endDate } = req.query;
-
-    const filter = {};
-    if (startDate || endDate) {
-      filter.date = {};
-      if (startDate) filter.date.$gte = new Date(startDate + 'T00:00:00.000Z');
-      if (endDate)   filter.date.$lte = new Date(endDate   + 'T23:59:59.999Z');
-    }
-
-    const logs = await DispatchLog.find(filter)
+    const logs = await DispatchLog.find()
       .populate('productId', 'name sku description')
       .sort({ date: -1 });
 
-    // Build flat rows for Excel
-    const rows = [];
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Inventory System';
+    workbook.created = new Date();
+
+    const sheet = workbook.addWorksheet('Dispatch Report', {
+      pageSetup: { fitToPage: true, orientation: 'landscape' },
+    });
+
+    // ── Column definitions ──────────────────────────────────────────────────
+    sheet.columns = [
+      { header: 'Sr. No.',              key: 'sr',          width: 8  },
+      { header: 'Dispatch Date',        key: 'date',        width: 18 },
+      { header: 'Product Name',         key: 'product',     width: 40 },
+      { header: 'SKU / Material Code',  key: 'sku',         width: 28 },
+      { header: 'Total Qty Dispatched', key: 'totalQty',    width: 22 },
+      { header: 'Source Location',      key: 'location',    width: 22 },
+      { header: 'Batch Qty',            key: 'batchQty',    width: 14 },
+      { header: 'Invoice No.',          key: 'invoiceNo',   width: 20 },
+      { header: 'Ship Name',            key: 'shipName',    width: 26 },
+    ];
+
+    // ── Style the header row ────────────────────────────────────────────────
+    const headerRow = sheet.getRow(1);
+    headerRow.eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A5F' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      cell.border = {
+        top:    { style: 'thin', color: { argb: 'FFAAAAAA' } },
+        left:   { style: 'thin', color: { argb: 'FFAAAAAA' } },
+        bottom: { style: 'thin', color: { argb: 'FFAAAAAA' } },
+        right:  { style: 'thin', color: { argb: 'FFAAAAAA' } },
+      };
+    });
+    headerRow.height = 28;
+
+    // ── Helper: format date as DD-MM-YYYY ───────────────────────────────────
+    const fmtDate = (d) => {
+      if (!d) return 'N/A';
+      const dt = new Date(d);
+      const dd = String(dt.getUTCDate()).padStart(2, '0');
+      const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+      const yyyy = dt.getUTCFullYear();
+      return `${dd}-${mm}-${yyyy}`;
+    };
+
+    // ── Populate rows ───────────────────────────────────────────────────────
+    let sr = 1;
+    let rowIndex = 2; // data starts at row 2
+
     for (const log of logs) {
-      const dispatchDate = log.date
-        ? new Date(log.date).toLocaleDateString('en-GB') // DD/MM/YYYY
-        : 'N/A';
-
       const productName = log.productId?.name || 'Unknown';
-      const sku = log.productId?.sku || '';
+      const sku         = log.productId?.sku  || log.productId?.description || '';
+      const dispDate    = fmtDate(log.date);
+      const batches     = log.dispatchedFrom || [];
 
-      if (log.dispatchedFrom && log.dispatchedFrom.length > 0) {
-        for (const df of log.dispatchedFrom) {
-          const arrivalDate = df.arrivalDate
-            ? new Date(df.arrivalDate).toLocaleDateString('en-GB')
-            : 'N/A';
+      if (batches.length === 0) {
+        // Single row with no batch detail
+        const row = sheet.addRow({
+          sr:       sr++,
+          date:     dispDate,
+          product:  productName,
+          sku,
+          totalQty: log.qty,
+          location: '',
+          batchQty: '',
+          invoiceNo:'',
+          shipName: '',
+        });
+        styleDataRow(row, rowIndex++);
+      } else {
+        // One row per batch; merge sr/date/product/sku/totalQty across them
+        const startRow = rowIndex;
 
-          rows.push({
-            'Dispatch Date'    : dispatchDate,
-            'Product Name'     : productName,
-            'SKU / Material'   : sku,
-            'Location'         : df.location || 'N/A',
-            'Dispatched Qty'   : df.qty,
-            'Invoice No.'      : df.invoiceNo || 'N/A',
-            'Ship Name'        : df.shipName  || 'N/A',
-            'Arrival Date'     : arrivalDate,
-            'Total Dispatch Qty': log.qty,
+        // Fetch full stock-entry details so we have invoiceNo + shipName
+        const stockEntryIds = batches.map(b => b.stockEntryId).filter(Boolean);
+        const stockEntries  = await StockEntry.find({ _id: { $in: stockEntryIds } });
+        const seMap = stockEntries.reduce((acc, se) => {
+          acc[String(se._id)] = se;
+          return acc;
+        }, {});
+
+        for (let i = 0; i < batches.length; i++) {
+          const b   = batches[i];
+          const se  = seMap[String(b.stockEntryId)] || {};
+          const row = sheet.addRow({
+            sr:       i === 0 ? sr : '',
+            date:     i === 0 ? dispDate : '',
+            product:  i === 0 ? productName : '',
+            sku:      i === 0 ? sku : '',
+            totalQty: i === 0 ? log.qty : '',
+            location: b.location || '',
+            batchQty: b.qty,
+            invoiceNo: se.invoiceNo || b.invoiceNo || '',
+            shipName:  se.shipName  || b.shipName  || '',
+          });
+          styleDataRow(row, rowIndex++);
+        }
+
+        // Merge spanning cells when more than one batch row
+        if (batches.length > 1) {
+          const endRow = startRow + batches.length - 1;
+          ['A','B','C','D','E'].forEach(col => {
+            sheet.mergeCells(`${col}${startRow}:${col}${endRow}`);
+            const cell = sheet.getCell(`${col}${startRow}`);
+            cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
           });
         }
-      } else {
-        rows.push({
-          'Dispatch Date'    : dispatchDate,
-          'Product Name'     : productName,
-          'SKU / Material'   : sku,
-          'Location'         : 'N/A',
-          'Dispatched Qty'   : log.qty,
-          'Invoice No.'      : 'N/A',
-          'Ship Name'        : 'N/A',
-          'Arrival Date'     : 'N/A',
-          'Total Dispatch Qty': log.qty,
-        });
+        sr++;
       }
     }
 
-    // Generate Excel workbook
-    const wb = xlsx.utils.book_new();
-    const ws = xlsx.utils.json_to_sheet(rows);
+    // ── Row style helper ────────────────────────────────────────────────────
+    function styleDataRow(row, idx) {
+      const bg = idx % 2 === 0 ? 'FFF0F4FF' : 'FFFFFFFF';
+      row.eachCell({ includeEmpty: true }, (cell) => {
+        cell.font      = { size: 10 };
+        cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } };
+        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+        cell.border    = {
+          top:    { style: 'hair', color: { argb: 'FFCCCCCC' } },
+          left:   { style: 'hair', color: { argb: 'FFCCCCCC' } },
+          bottom: { style: 'hair', color: { argb: 'FFCCCCCC' } },
+          right:  { style: 'hair', color: { argb: 'FFCCCCCC' } },
+        };
+      });
+      row.height = 20;
+    }
 
-    // Auto column widths (estimate)
-    const colWidths = [
-      { wch: 14 }, { wch: 40 }, { wch: 20 }, { wch: 20 },
-      { wch: 14 }, { wch: 18 }, { wch: 24 }, { wch: 14 }, { wch: 18 }
-    ];
-    ws['!cols'] = colWidths;
+    // ── Summary row ─────────────────────────────────────────────────────────
+    const totalDispatched = logs.reduce((sum, l) => sum + l.qty, 0);
+    const summaryRow = sheet.addRow({
+      sr:       '',
+      date:     '',
+      product:  'TOTAL',
+      sku:      '',
+      totalQty: totalDispatched,
+      location: '',
+      batchQty: '',
+      invoiceNo:'',
+      shipName: '',
+    });
+    summaryRow.eachCell({ includeEmpty: true }, (cell) => {
+      cell.font = { bold: true, size: 11 };
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A5F' } };
+      cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      cell.alignment = { vertical: 'middle', horizontal: 'center' };
+    });
+    summaryRow.height = 24;
 
-    xlsx.utils.book_append_sheet(wb, ws, 'Dispatch Report');
+    // ── Send the file ───────────────────────────────────────────────────────
+    const now  = new Date();
+    const dateStamp = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}${String(now.getDate()).padStart(2,'0')}`;
+    const filename  = `dispatch_report_${dateStamp}.xlsx`;
 
-    const buffer = xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
-
-    const filename = `Dispatch_Report_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader('Content-Type',        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.send(buffer);
+
+    await workbook.xlsx.write(res);
+    res.end();
   } catch (error) {
     console.error('Export Error:', error);
-    res.status(500).json({ message: 'Error generating report', error: error.message });
+    res.status(500).json({ message: 'Error exporting report', error: error.message });
   }
 };
 
 exports.getDashboardStats = async (req, res) => {
   try {
+    const { startDate, endDate } = req.query;
+    
     const totalProducts = await Product.countDocuments();
     const totalStock = await Product.aggregate([
       { $group: { _id: null, total: { $sum: "$totalQty" } } },
@@ -441,13 +583,28 @@ exports.getDashboardStats = async (req, res) => {
 
     const lowStockItems = await Product.find({ totalQty: { $lt: 20 } });
 
-    const recentLogs = await DispatchLog.find()
+    let dateFilter = {};
+    if (startDate && endDate) {
+        const start = new Date(startDate);
+        start.setHours(0,0,0,0);
+        const end = new Date(endDate);
+        end.setHours(23,59,59,999);
+        dateFilter = { $gte: start, $lte: end };
+    }
+
+    const logQuery = Object.keys(dateFilter).length ? { date: dateFilter } : {};
+    const recentLogs = await DispatchLog.find(logQuery)
       .populate("productId", "name sku description")
       .sort({ date: -1 })
       .limit(10);
 
     // FIFO Order View: All available stock entries sorted by date
-    const fifoOrderView = await StockEntry.find({ remainingQty: { $gt: 0 } })
+    const stockQuery = { remainingQty: { $gt: 0 } };
+    if (Object.keys(dateFilter).length) {
+        stockQuery.arrivalDate = dateFilter;
+    }
+
+    const fifoOrderView = await StockEntry.find(stockQuery)
       .populate("productId", "name")
       .sort({ arrivalDate: 1 });
 
@@ -463,5 +620,40 @@ exports.getDashboardStats = async (req, res) => {
     res
       .status(500)
       .json({ message: "Error fetching stats", error: error.message });
+  }
+};
+
+exports.downloadUploadedFile = async (req, res) => {
+  try {
+    const log = await UploadLog.findById(req.params.id);
+    if (!log) return res.status(404).json({ message: 'Upload history not found' });
+
+    const absolutePath = path.resolve(log.filePath);
+    if (!fs.existsSync(absolutePath)) {
+        return res.status(404).json({ message: 'File no longer exists on server' });
+    }
+
+    res.download(absolutePath, log.originalFileName);
+  } catch (error) {
+    res.status(500).json({ message: 'Error downloading file', error: error.message });
+  }
+};
+
+exports.deleteProduct = async (req, res) => {
+  try {
+    const { productId } = req.params;
+    
+    const deletedProduct = await Product.findByIdAndDelete(productId);
+    if (!deletedProduct) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    await StockEntry.deleteMany({ productId: productId });
+    await DispatchLog.deleteMany({ productId: productId });
+
+    res.status(200).json({ message: "Product and associated stock deleted successfully" });
+  } catch (error) {
+    console.error("Delete Error:", error);
+    res.status(500).json({ message: "Error deleting product", error: error.message });
   }
 };
