@@ -3,7 +3,10 @@
   "builds": [
     {
       "src": "index.js",
-      "use": "@vercel/node"
+      "use": "@vercel/node",
+      "config": {
+        "maxDuration": 30
+      }
     }
   ],
   "routes": [
@@ -11,5 +14,14 @@
       "src": "/(.*)",
       "dest": "index.js"
     }
-  ]
+  ],
+  "env": {
+    "NODE_ENV": "production"
+  },
+  "errorResponse": {
+    "statusCode": 500,
+    "body": {
+      "message": "Internal Server Error"
+    }
+  }
 }
