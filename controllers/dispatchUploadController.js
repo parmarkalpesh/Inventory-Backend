@@ -10,7 +10,8 @@ exports.uploadDispatchExcel = async (req, res) => {
         }
 
         const workbook = new ExcelJS.Workbook();
-        await workbook.xlsx.readFile(req.file.path);
+        // Use buffer for serverless (memory storage)
+        await workbook.xlsx.load(req.file.buffer);
         const worksheet = workbook.getWorksheet(1);
 
         const data = [];
@@ -52,7 +53,7 @@ exports.uploadDispatchExcel = async (req, res) => {
         const uploadLog = new UploadLog({
             uploadType: 'dispatch',
             originalFileName: req.file.originalname,
-            filePath: req.file.path,
+            filePath: 'memory-storage', // File stored in memory for serverless
             rowCount: data.length
         });
         await uploadLog.save();

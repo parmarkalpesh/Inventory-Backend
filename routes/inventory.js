@@ -11,7 +11,8 @@ const asyncHandler = (fn) => (req, res, next) => {
   Promise.resolve(fn(req, res, next)).catch(next);
 };
 
-const upload = multer({ dest: "uploads/" });
+// Use memory storage for serverless (Vercel doesn't have persistent filesystem)
+const upload = multer({ storage: multer.memoryStorage() });
 
 // Auth
 router.post("/auth/login", asyncHandler(authController.login));

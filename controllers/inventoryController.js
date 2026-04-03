@@ -14,7 +14,8 @@ exports.uploadExcel = async (req, res) => {
     }
 
     const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.readFile(req.file.path);
+    // Use buffer for serverless (memory storage)
+    await workbook.xlsx.load(req.file.buffer);
     const worksheet = workbook.getWorksheet(1);
 
     const data = [];
@@ -230,7 +231,7 @@ exports.uploadExcel = async (req, res) => {
     const uploadLog = new UploadLog({
       uploadType: 'inventory',
       originalFileName: req.file.originalname,
-      filePath: req.file.path,
+      filePath: 'memory-storage', // File stored in memory for serverless
       rowCount: data.length
     });
     await uploadLog.save();
@@ -627,6 +628,11 @@ exports.downloadUploadedFile = async (req, res) => {
   try {
     const log = await UploadLog.findById(req.params.id);
     if (!log) return res.status(404).json({ message: 'Upload history not found' });
+
+    // Files stored in memory (serverless) cannot be downloaded
+    if (log.filePath === 'memory-storage') {
+        return res.status(400).json({ message: 'File downloads are not available for files processed in serverless environment. Please re-upload the file to download it.' });
+    }
 
     const absolutePath = path.resolve(log.filePath);
     if (!fs.existsSync(absolutePath)) {
