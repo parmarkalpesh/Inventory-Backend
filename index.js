@@ -4,7 +4,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 require("dotenv").config();
 
-const inventoryRoutes = require("../routes/inventory");
+const inventoryRoutes = require("./routes/inventory");
 
 const app = express();
 
